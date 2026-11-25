@@ -9,8 +9,12 @@ import sys
 import time
 import uuid
 from collections import defaultdict
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, NamedTuple, TypedDict
+
+import yaml
 
 from mlflow.entities import (
     Assessment,
@@ -65,6 +69,7 @@ from mlflow.store.tracking import (
 )
 from mlflow.store.tracking._sql_backend_utils import filestore_not_supported
 from mlflow.store.tracking.abstract_store import AbstractStore
+from mlflow.store.tracking.run_metadata_merge import atomic_replace_write, run_write_lock
 from mlflow.tracing.utils import (
     generate_assessment_id,
     generate_request_id_v2,
@@ -125,7 +130,7 @@ from mlflow.utils.validation import (
     _validate_tag_name,
     invalid_value,
 )
-from mlflow.utils.yaml_utils import overwrite_yaml, read_yaml, write_yaml
+from mlflow.utils.yaml_utils import YamlSafeDumper, overwrite_yaml, read_yaml, write_yaml
 
 if TYPE_CHECKING:
     from mlflow.entities.model_registry.prompt_version import PromptVersion
@@ -315,6 +320,44 @@ class FileStore(AbstractStore):
         if not self._has_experiment(experiment_id):
             return None
         return os.path.join(self._get_experiment_path(experiment_id, assert_exists=True), run_uuid)
+
+    def resolve_run_dir(self, run_id: str) -> str:
+        """Return the on-disk run directory for an existing run (active or deleted)."""
+        _experiment_id, run_dir = self._find_run_root(run_id)
+        if run_dir is None:
+            raise MlflowException(
+                f"Run '{run_id}' not found", databricks_pb2.RESOURCE_DOES_NOT_EXIST
+            )
+        return str(run_dir)
+
+    @contextmanager
+    def _run_write_lock(self, run_id: str) -> Iterator[None]:
+        """Reentrant per-run exclusive lock shared by all run-mutating operations."""
+        with run_write_lock(self, run_id):
+            yield
+
+    def _overwrite_run_info_atomic(self, run_info, deleted_time=None):
+        """Persist RunInfo via a temp-file + os.replace so readers never see a partial meta.yaml."""
+        run_dir = self._get_run_dir(run_info.experiment_id, run_info.run_id)
+        run_info_dict = _make_persisted_run_info_dict(run_info)
+        if deleted_time is not None:
+            run_info_dict["deleted_time"] = deleted_time
+        payload = yaml.dump(
+            run_info_dict,
+            default_flow_style=False,
+            allow_unicode=True,
+            sort_keys=True,
+            Dumper=YamlSafeDumper,
+        )
+        atomic_replace_write(os.path.join(run_dir, FileStore.META_DATA_FILE_NAME), payload)
+
+    def _set_run_name(self, run_info, run_name):
+        """Update mlflow.runName and synchronize meta.yaml while holding the run lock."""
+        self._set_run_tag(run_info, RunTag(MLFLOW_RUN_NAME, run_name))
+        run_status = RunStatus.from_string(run_info.status)
+        new_info = run_info._copy_with_overrides(run_status, run_info.end_time, run_name=run_name)
+        self._overwrite_run_info_atomic(new_info)
+        return new_info
 
     def _get_metric_path(self, experiment_id, run_uuid, metric_key):
         _validate_run_id(run_uuid)
@@ -650,14 +693,15 @@ class FileStore(AbstractStore):
         )
 
     def delete_run(self, run_id):
-        run_info = self._get_run_info(run_id)
-        if run_info is None:
-            raise MlflowException(
-                f"Run '{run_id}' metadata is in invalid state.",
-                databricks_pb2.INVALID_STATE,
-            )
-        new_info = run_info._copy_with_overrides(lifecycle_stage=LifecycleStage.DELETED)
-        self._overwrite_run_info(new_info, deleted_time=get_current_time_millis())
+        with self._run_write_lock(run_id):
+            run_info = self._get_run_info(run_id)
+            if run_info is None:
+                raise MlflowException(
+                    f"Run '{run_id}' metadata is in invalid state.",
+                    databricks_pb2.INVALID_STATE,
+                )
+            new_info = run_info._copy_with_overrides(lifecycle_stage=LifecycleStage.DELETED)
+            self._overwrite_run_info_atomic(new_info, deleted_time=get_current_time_millis())
 
     def _hard_delete_run(self, run_id):
         """
@@ -695,14 +739,15 @@ class FileStore(AbstractStore):
         return deleted_run_ids
 
     def restore_run(self, run_id):
-        run_info = self._get_run_info(run_id)
-        if run_info is None:
-            raise MlflowException(
-                f"Run '{run_id}' metadata is in invalid state.",
-                databricks_pb2.INVALID_STATE,
-            )
-        new_info = run_info._copy_with_overrides(lifecycle_stage=LifecycleStage.ACTIVE)
-        self._overwrite_run_info(new_info, deleted_time=None)
+        with self._run_write_lock(run_id):
+            run_info = self._get_run_info(run_id)
+            if run_info is None:
+                raise MlflowException(
+                    f"Run '{run_id}' metadata is in invalid state.",
+                    databricks_pb2.INVALID_STATE,
+                )
+            new_info = run_info._copy_with_overrides(lifecycle_stage=LifecycleStage.ACTIVE)
+            self._overwrite_run_info_atomic(new_info, deleted_time=None)
 
     def _find_experiment_folder(self, run_path):
         """
@@ -744,13 +789,14 @@ class FileStore(AbstractStore):
 
     def update_run_info(self, run_id, run_status, end_time, run_name):
         _validate_run_id(run_id)
-        run_info = self._get_run_info(run_id)
-        check_run_is_active(run_info)
-        new_info = run_info._copy_with_overrides(run_status, end_time, run_name=run_name)
-        if run_name:
-            self._set_run_tag(run_info, RunTag(MLFLOW_RUN_NAME, run_name))
-        self._overwrite_run_info(new_info)
-        return new_info
+        with self._run_write_lock(run_id):
+            run_info = self._get_run_info(run_id)
+            check_run_is_active(run_info)
+            new_info = run_info._copy_with_overrides(run_status, end_time, run_name=run_name)
+            if run_name:
+                self._set_run_tag(run_info, RunTag(MLFLOW_RUN_NAME, run_name))
+            self._overwrite_run_info_atomic(new_info)
+            return new_info
 
     def create_run(self, experiment_id, user_id, start_time, tags, run_name):
         """
@@ -1106,16 +1152,17 @@ class FileStore(AbstractStore):
     def log_metric(self, run_id: str, metric: Metric):
         _validate_run_id(run_id)
         _validate_metric(metric.key, metric.value, metric.timestamp, metric.step)
-        run_info = self._get_run_info(run_id)
-        check_run_is_active(run_info)
-        self._log_run_metric(run_info, metric)
-        if metric.model_id is not None:
-            self._log_model_metric(
-                experiment_id=run_info.experiment_id,
-                model_id=metric.model_id,
-                run_id=run_id,
-                metric=metric,
-            )
+        with self._run_write_lock(run_id):
+            run_info = self._get_run_info(run_id)
+            check_run_is_active(run_info)
+            self._log_run_metric(run_info, metric)
+            if metric.model_id is not None:
+                self._log_model_metric(
+                    experiment_id=run_info.experiment_id,
+                    model_id=metric.model_id,
+                    run_id=run_id,
+                    metric=metric,
+                )
 
     def _log_run_metric(self, run_info, metric):
         metric_path = self._get_metric_path(run_info.experiment_id, run_info.run_id, metric.key)
@@ -1154,9 +1201,10 @@ class FileStore(AbstractStore):
     def log_param(self, run_id, param):
         _validate_run_id(run_id)
         param = _validate_param(param.key, param.value)
-        run_info = self._get_run_info(run_id)
-        check_run_is_active(run_info)
-        self._log_run_param(run_info, param)
+        with self._run_write_lock(run_id):
+            run_info = self._get_run_info(run_id)
+            check_run_is_active(run_info)
+            self._log_run_param(run_info, param)
 
     def _log_run_param(self, run_info, param):
         param_path = self._get_param_path(run_info.experiment_id, run_info.run_id, param.key)
@@ -1235,12 +1283,13 @@ class FileStore(AbstractStore):
     def set_tag(self, run_id, tag):
         _validate_run_id(run_id)
         _validate_tag_name(tag.key)
-        run_info = self._get_run_info(run_id)
-        check_run_is_active(run_info)
-        self._set_run_tag(run_info, tag)
-        if tag.key == MLFLOW_RUN_NAME:
-            run_status = RunStatus.from_string(run_info.status)
-            self.update_run_info(run_id, run_status, run_info.end_time, tag.value)
+        with self._run_write_lock(run_id):
+            run_info = self._get_run_info(run_id)
+            check_run_is_active(run_info)
+            self._set_run_tag(run_info, tag)
+            if tag.key == MLFLOW_RUN_NAME:
+                run_status = RunStatus.from_string(run_info.status)
+                self.update_run_info(run_id, run_status, run_info.end_time, tag.value)
 
     def _set_run_tag(self, run_info, tag):
         tag_path = self._get_tag_path(run_info.experiment_id, run_info.run_id, tag.key)
@@ -1257,51 +1306,51 @@ class FileStore(AbstractStore):
             key: Name of the tag.
         """
         _validate_run_id(run_id)
-        run_info = self._get_run_info(run_id)
-        check_run_is_active(run_info)
-        tag_path = self._get_tag_path(run_info.experiment_id, run_id, key)
-        if not exists(tag_path):
-            raise MlflowException(
-                f"No tag with name: {key} in run with id {run_id}",
-                error_code=RESOURCE_DOES_NOT_EXIST,
-            )
-        os.remove(tag_path)
+        with self._run_write_lock(run_id):
+            run_info = self._get_run_info(run_id)
+            check_run_is_active(run_info)
+            tag_path = self._get_tag_path(run_info.experiment_id, run_id, key)
+            if not exists(tag_path):
+                raise MlflowException(
+                    f"No tag with name: {key} in run with id {run_id}",
+                    error_code=RESOURCE_DOES_NOT_EXIST,
+                )
+            os.remove(tag_path)
 
     def _overwrite_run_info(self, run_info, deleted_time=None):
-        run_dir = self._get_run_dir(run_info.experiment_id, run_info.run_id)
-        run_info_dict = _make_persisted_run_info_dict(run_info)
-        if deleted_time is not None:
-            run_info_dict["deleted_time"] = deleted_time
-        write_yaml(run_dir, FileStore.META_DATA_FILE_NAME, run_info_dict, overwrite=True)
+        self._overwrite_run_info_atomic(run_info, deleted_time=deleted_time)
 
     def log_batch(self, run_id, metrics, params, tags):
         _validate_run_id(run_id)
         metrics, params, tags = _validate_batch_log_data(metrics, params, tags)
         _validate_batch_log_limits(metrics, params, tags)
         _validate_param_keys_unique(params)
-        run_info = self._get_run_info(run_id)
-        check_run_is_active(run_info)
-        try:
-            for param in params:
-                self._log_run_param(run_info, param)
-            for metric in metrics:
-                self._log_run_metric(run_info, metric)
-                if metric.model_id is not None:
-                    self._log_model_metric(
-                        experiment_id=run_info.experiment_id,
-                        model_id=metric.model_id,
-                        run_id=run_id,
-                        metric=metric,
-                    )
-            for tag in tags:
-                # NB: If the tag run name value is set, update the run info to assure
-                # synchronization.
-                if tag.key == MLFLOW_RUN_NAME:
-                    run_status = RunStatus.from_string(run_info.status)
-                    self.update_run_info(run_id, run_status, run_info.end_time, tag.value)
-                self._set_run_tag(run_info, tag)
-        except Exception as e:
-            raise MlflowException(e, INTERNAL_ERROR)
+        with self._run_write_lock(run_id):
+            run_info = self._get_run_info(run_id)
+            check_run_is_active(run_info)
+            try:
+                for param in params:
+                    self._log_run_param(run_info, param)
+                for metric in metrics:
+                    self._log_run_metric(run_info, metric)
+                    if metric.model_id is not None:
+                        self._log_model_metric(
+                            experiment_id=run_info.experiment_id,
+                            model_id=metric.model_id,
+                            run_id=run_id,
+                            metric=metric,
+                        )
+                for tag in tags:
+                    # NB: If the tag run name value is set, update the run info to assure
+                    # synchronization.
+                    if tag.key == MLFLOW_RUN_NAME:
+                        run_status = RunStatus.from_string(run_info.status)
+                        self.update_run_info(run_id, run_status, run_info.end_time, tag.value)
+                    self._set_run_tag(run_info, tag)
+            except MlflowException:
+                raise
+            except Exception as e:
+                raise MlflowException(str(e), INTERNAL_ERROR)
 
     def record_logged_model(self, run_id, mlflow_model):
         from mlflow.models import Model
@@ -1311,22 +1360,24 @@ class FileStore(AbstractStore):
                 f"Argument 'mlflow_model' should be mlflow.models.Model, got '{type(mlflow_model)}'"
             )
         _validate_run_id(run_id)
-        run_info = self._get_run_info(run_id)
-        check_run_is_active(run_info)
-        model_dict = mlflow_model.get_tags_dict()
-        run_info = self._get_run_info(run_id)
-        path = self._get_tag_path(run_info.experiment_id, run_info.run_id, MLFLOW_LOGGED_MODELS)
-        if os.path.exists(path):
-            with open(path) as f:
-                model_list = json.loads(f.read())
-        else:
-            model_list = []
-        tag = RunTag(MLFLOW_LOGGED_MODELS, json.dumps(model_list + [model_dict]))
+        with self._run_write_lock(run_id):
+            run_info = self._get_run_info(run_id)
+            check_run_is_active(run_info)
+            model_dict = mlflow_model.get_tags_dict()
+            path = self._get_tag_path(run_info.experiment_id, run_info.run_id, MLFLOW_LOGGED_MODELS)
+            if os.path.exists(path):
+                with open(path) as f:
+                    model_list = json.loads(f.read())
+            else:
+                model_list = []
+            tag = RunTag(MLFLOW_LOGGED_MODELS, json.dumps(model_list + [model_dict]))
 
-        try:
-            self._set_run_tag(run_info, tag)
-        except Exception as e:
-            raise MlflowException(e, INTERNAL_ERROR)
+            try:
+                self._set_run_tag(run_info, tag)
+            except MlflowException:
+                raise
+            except Exception as e:
+                raise MlflowException(str(e), INTERNAL_ERROR)
 
     def log_inputs(
         self,
